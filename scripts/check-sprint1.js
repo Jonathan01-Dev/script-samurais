@@ -9,11 +9,19 @@ async function waitFor(conditionFn, timeoutMs = 60000, pollMs = 500) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (conditionFn()) {
+ feature/s1
+      return { ok: true, elapsedMs: Date.now() - started };
+    }
+    await sleep(pollMs);
+  }
+  return { ok: false, elapsedMs: Date.now() - started };
+
       return { ok: true, elapsedMs: Math.max(0, Date.now() - started) };
     }
     await sleep(pollMs);
   }
   return { ok: false, elapsedMs: Math.max(0, Date.now() - started) };
+ main
 }
 
 async function main() {
