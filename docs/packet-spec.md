@@ -35,3 +35,10 @@ Chaque message TCP est encode en TLV:
 - `HELLO` emis toutes les 30 secondes
 - timeout pair mort: 90 secondes
 - keepalive TCP ping/pong: 15 secondes
+
+## Notes Sprint 3-ready
+
+- `MANIFEST` transporte les metadonnees fichier/chunks.
+- `CHUNK_REQ` demande un bloc par index.
+- `CHUNK_DATA` retourne le bloc + hash SHA-256.
+- `ACK` transporte les statuts: OK / HASH_MISMATCH / NOT_FOUND.

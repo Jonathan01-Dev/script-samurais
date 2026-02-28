@@ -133,3 +133,8 @@ bash demo/check_s0.sh
 ```bash
 npm run check:s1
 ```
+
+## Lancer le check Sprint 3
+```bash
+npm run check:s3
+```
