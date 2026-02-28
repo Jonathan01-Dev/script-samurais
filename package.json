@@ -11,6 +11,7 @@
     "node:run:2": "node src/cli.js run --node node2 --tcp-port 7778",
     "node:run:3": "node src/cli.js run --node node3 --tcp-port 7779",
     "smoke:network": "node scripts/smoke-network.js",
-    "check:s1": "node scripts/check-sprint1.js"
+    "check:s1": "node scripts/check-sprint1.js",
+    "check:s2": "node scripts/check-sprint2.js"
   }
 }
