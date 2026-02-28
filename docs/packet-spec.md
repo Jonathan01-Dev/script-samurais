@@ -21,6 +21,9 @@
 - `0x05` `CHUNK_DATA`
 - `0x06` `MANIFEST`
 - `0x07` `ACK`
+- `0x08` `HELLO_REPLY`
+- `0x09` `AUTH`
+- `0x0A` `AUTH_OK`
 
 ## Encodage TLV sur TCP
 

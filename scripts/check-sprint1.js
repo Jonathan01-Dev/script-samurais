@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { ArchipelNodeRuntime } from '../src/node-runtime.js';
 
 function sleep(ms) {
@@ -25,11 +26,14 @@ async function waitFor(conditionFn, timeoutMs = 60000, pollMs = 500) {
 }
 
 async function main() {
+  execSync('node scripts/generate-keys.js --count=3', { stdio: 'ignore' });
+
   const common = {
     discoveryPort: 6200,
     helloIntervalMs: 1000,
     peerTimeoutMs: 9000,
-    keepAliveIntervalMs: 1200
+    keepAliveIntervalMs: 1200,
+    trustDir: path.join(process.cwd(), '.archipel', 's1-check')
   };
 
   const node1 = new ArchipelNodeRuntime({

@@ -1,7 +1,20 @@
 import dgram from 'node:dgram';
 import net from 'node:net';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  diffieHellman,
+  generateKeyPairSync,
+  hkdfSync,
+  randomBytes,
+  sign,
+  verify
+} from 'node:crypto';
 import { buildPacket, PACKET_TYPES, parsePacket } from './packet.js';
 import { PeerTable } from './peer-table.js';
 import { CONFIG } from './config.js';
@@ -15,11 +28,18 @@ function parseJsonPayload(payload) {
   }
 }
 
+function normalizeIp(value) {
+  return String(value || '').replace('::ffff:', '');
+}
+
+function sha256Hex(input) {
+  return createHash('sha256').update(input).digest('hex');
+}
+
 export class ArchipelNodeRuntime {
   constructor(options = {}) {
     const keyDir = options.keyDir || path.join(process.cwd(), 'keys', 'node1');
     const nodeIdHex = readFileSync(path.join(keyDir, 'node-id.txt'), 'utf8').trim();
-
     if (nodeIdHex.length !== 64) {
       throw new Error(`invalid node-id format in ${keyDir}`);
     }
@@ -27,6 +47,9 @@ export class ArchipelNodeRuntime {
     this.nodeIdHex = nodeIdHex;
     this.nodeId = Buffer.from(nodeIdHex, 'hex');
     this.publicKeyPem = readFileSync(path.join(keyDir, 'public.pem'), 'utf8');
+    this.privateKeyPem = readFileSync(path.join(keyDir, 'private.pem'), 'utf8');
+    this.publicKey = createPublicKey(this.publicKeyPem);
+    this.privateKey = createPrivateKey(this.privateKeyPem);
 
     this.hmacKey = Buffer.from(options.hmacKey || process.env.HMAC_KEY || 'archipel-dev-key');
     this.tcpPort = Number(options.tcpPort || CONFIG.tcpPort);
@@ -41,6 +64,29 @@ export class ArchipelNodeRuntime {
     this.manifest = options.manifest || { shared_files: [] };
     this.sockets = new Set();
     this.peerSockets = new Map();
+
+    this.sessions = new Map();
+    this.pendingHandshakes = new Map();
+    this.inbox = [];
+
+    const trustDir = options.trustDir || path.join(process.cwd(), '.archipel');
+    mkdirSync(trustDir, { recursive: true });
+    this.trustStorePath = path.join(trustDir, 'trust-store.json');
+    this.trustStore = this.loadTrustStore();
+  }
+
+  loadTrustStore() {
+    try {
+      const raw = readFileSync(this.trustStorePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  saveTrustStore() {
+    writeFileSync(this.trustStorePath, JSON.stringify(this.trustStore, null, 2));
   }
 
   async start() {
@@ -82,6 +128,14 @@ export class ArchipelNodeRuntime {
     return this.peerTable.list();
   }
 
+  getInbox() {
+    return [...this.inbox];
+  }
+
+  hasSecureSession(peerIdHex) {
+    return this.sessions.has(peerIdHex);
+  }
+
   async startUdpDiscovery() {
     this.udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     this.udpSocket.on('error', (err) => {
@@ -114,7 +168,7 @@ export class ArchipelNodeRuntime {
       JSON.stringify({
         tcp_port: this.tcpPort,
         node_id: this.nodeIdHex,
-        capabilities: ['discovery', 'tcp', 'manifest'],
+        capabilities: ['discovery', 'tcp', 'manifest', 'e2e'],
         manifest: this.manifest,
         ts: Date.now()
       })
@@ -171,11 +225,7 @@ export class ArchipelNodeRuntime {
     });
 
     if (outbound) {
-      const helloPayload = Buffer.from(
-        JSON.stringify({ tcp_port: this.tcpPort, ts: Date.now(), mode: 'outbound-handshake' })
-      );
-      this.sendPacket(socket, PACKET_TYPES.HELLO, helloPayload);
-      this.sendPeerList(socket);
+      this.startHandshakeAsInitiator(socket);
     }
   }
 
@@ -193,8 +243,7 @@ export class ArchipelNodeRuntime {
   hasSocketTo(ip, tcpPort) {
     for (const socket of this.sockets) {
       if (socket.destroyed) continue;
-      const remoteAddress = String(socket.remoteAddress || '').replace('::ffff:', '');
-      if (remoteAddress === ip && socket.remotePort === tcpPort) return true;
+      if (normalizeIp(socket.remoteAddress) === ip && socket.remotePort === tcpPort) return true;
     }
     return false;
   }
@@ -204,6 +253,182 @@ export class ArchipelNodeRuntime {
     const payload = Buffer.from(JSON.stringify({ manifest, ts: Date.now() }));
     for (const socket of this.sockets) {
       this.sendPacket(socket, PACKET_TYPES.MANIFEST, payload);
+    }
+  }
+
+  startHandshakeAsInitiator(socket) {
+    const eph = generateKeyPairSync('x25519');
+    socket.__localEphPrivate = eph.privateKey;
+    socket.__localEphPublicPem = eph.publicKey.export({ type: 'spki', format: 'pem' });
+
+    const payload = Buffer.from(
+      JSON.stringify({
+        tcp_port: this.tcpPort,
+        ts: Date.now(),
+        e_pub: socket.__localEphPublicPem
+      })
+    );
+    this.sendPacket(socket, PACKET_TYPES.HELLO, payload);
+  }
+
+  trustPeer(peerIdHex, identityPubPem) {
+    const fingerprint = sha256Hex(identityPubPem);
+    const known = this.trustStore[peerIdHex];
+    if (!known) {
+      this.trustStore[peerIdHex] = {
+        fingerprint,
+        identity_pub_pem: identityPubPem,
+        first_seen: Date.now()
+      };
+      this.saveTrustStore();
+      return true;
+    }
+    return known.fingerprint === fingerprint;
+  }
+
+  deriveSession(localPrivateKey, remotePublicPem) {
+    const shared = diffieHellman({
+      privateKey: localPrivateKey,
+      publicKey: createPublicKey(remotePublicPem)
+    });
+    const sessionKey = hkdfSync('sha256', shared, Buffer.alloc(0), Buffer.from('archipel-v1'), 32);
+    const sharedHash = createHash('sha256').update(shared).digest();
+    return { sessionKey, sharedHash };
+  }
+
+  onHello(socket, peerIdHex, data) {
+    if (!data?.e_pub) return;
+    const responderEph = generateKeyPairSync('x25519');
+    const responderEphPubPem = responderEph.publicKey.export({ type: 'spki', format: 'pem' });
+    const { sessionKey, sharedHash } = this.deriveSession(responderEph.privateKey, data.e_pub);
+    const sig = sign(null, sharedHash, this.privateKey).toString('base64');
+
+    this.pendingHandshakes.set(peerIdHex, {
+      socket,
+      sessionKey,
+      sharedHash
+    });
+
+    const payload = Buffer.from(
+      JSON.stringify({
+        e_pub: responderEphPubPem,
+        sig,
+        identity_pub: this.publicKeyPem,
+        ts: Date.now()
+      })
+    );
+    this.sendPacket(socket, PACKET_TYPES.HELLO_REPLY, payload);
+  }
+
+  onHelloReply(socket, peerIdHex, data) {
+    if (!data?.e_pub || !data?.sig || !data?.identity_pub || !socket.__localEphPrivate) return;
+
+    if (!this.trustPeer(peerIdHex, data.identity_pub)) {
+      console.warn(`[security] TOFU mismatch for ${peerIdHex}`);
+      socket.destroy();
+      return;
+    }
+
+    const { sessionKey, sharedHash } = this.deriveSession(socket.__localEphPrivate, data.e_pub);
+    const remoteIdentity = createPublicKey(data.identity_pub);
+    const sigOk = verify(null, sharedHash, remoteIdentity, Buffer.from(data.sig, 'base64'));
+    if (!sigOk) {
+      console.warn(`[security] invalid HELLO_REPLY signature from ${peerIdHex}`);
+      socket.destroy();
+      return;
+    }
+
+    this.pendingHandshakes.set(peerIdHex, {
+      socket,
+      sessionKey,
+      sharedHash
+    });
+
+    const authSig = sign(null, sharedHash, this.privateKey).toString('base64');
+    const payload = Buffer.from(
+      JSON.stringify({
+        sig: authSig,
+        identity_pub: this.publicKeyPem,
+        ts: Date.now()
+      })
+    );
+    this.sendPacket(socket, PACKET_TYPES.AUTH, payload);
+  }
+
+  onAuth(socket, peerIdHex, data) {
+    const pending = this.pendingHandshakes.get(peerIdHex);
+    if (!pending || !data?.sig || !data?.identity_pub) return;
+
+    if (!this.trustPeer(peerIdHex, data.identity_pub)) {
+      console.warn(`[security] TOFU mismatch for ${peerIdHex}`);
+      socket.destroy();
+      return;
+    }
+
+    const remoteIdentity = createPublicKey(data.identity_pub);
+    const sigOk = verify(null, pending.sharedHash, remoteIdentity, Buffer.from(data.sig, 'base64'));
+    if (!sigOk) {
+      console.warn(`[security] invalid AUTH signature from ${peerIdHex}`);
+      socket.destroy();
+      return;
+    }
+
+    this.sessions.set(peerIdHex, {
+      key: pending.sessionKey,
+      establishedAt: Date.now()
+    });
+    this.sendPacket(socket, PACKET_TYPES.AUTH_OK, Buffer.from(JSON.stringify({ ok: true, ts: Date.now() })));
+    this.sendPeerList(socket);
+  }
+
+  onAuthOk(peerIdHex) {
+    const pending = this.pendingHandshakes.get(peerIdHex);
+    if (!pending) return;
+    this.sessions.set(peerIdHex, {
+      key: pending.sessionKey,
+      establishedAt: Date.now()
+    });
+    this.sendPeerList(pending.socket);
+  }
+
+  sendEncryptedMessage(peerIdHex, plaintext) {
+    const session = this.sessions.get(peerIdHex);
+    const socket = this.peerSockets.get(peerIdHex);
+    if (!session || !socket) {
+      throw new Error(`no secure session with ${peerIdHex}`);
+    }
+
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', session.key, nonce);
+    const ciphertext = Buffer.concat([cipher.update(Buffer.from(plaintext, 'utf8')), cipher.final()]);
+    const tag = cipher.getAuthTag();
+
+    const payload = Buffer.from(
+      JSON.stringify({
+        nonce: nonce.toString('base64'),
+        tag: tag.toString('base64'),
+        ciphertext: ciphertext.toString('base64'),
+        ts: Date.now()
+      })
+    );
+    this.sendPacket(socket, PACKET_TYPES.MSG, payload);
+  }
+
+  onEncryptedMessage(peerIdHex, data) {
+    const session = this.sessions.get(peerIdHex);
+    if (!session || !data?.nonce || !data?.tag || !data?.ciphertext) return;
+
+    try {
+      const nonce = Buffer.from(data.nonce, 'base64');
+      const tag = Buffer.from(data.tag, 'base64');
+      const ciphertext = Buffer.from(data.ciphertext, 'base64');
+
+      const decipher = createDecipheriv('aes-256-gcm', session.key, nonce);
+      decipher.setAuthTag(tag);
+      const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+      this.inbox.push({ from: peerIdHex, plaintext, ts: Date.now() });
+    } catch {
+      console.warn(`[security] decrypt failed from ${peerIdHex}`);
     }
   }
 
@@ -229,8 +454,7 @@ export class ArchipelNodeRuntime {
       shared_files: data.manifest?.shared_files || []
     });
 
-    const knownConnection = this.hasSocketTo(rinfo.address, data.tcp_port);
-    if (!knownConnection) {
+    if (!this.hasSocketTo(rinfo.address, data.tcp_port)) {
       this.connectToPeer(rinfo.address, data.tcp_port);
     }
   }
@@ -245,13 +469,27 @@ export class ArchipelNodeRuntime {
 
     if (packet.type === PACKET_TYPES.HELLO && data) {
       this.peerTable.upsert(peerIdHex, {
-        ip: socket.remoteAddress,
+        ip: normalizeIp(socket.remoteAddress),
         tcp_port: data.tcp_port || socket.remotePort,
         last_seen: Date.now(),
         shared_files: data.manifest?.shared_files || []
       });
-      this.sendPacket(socket, PACKET_TYPES.ACK, Buffer.from(JSON.stringify({ ok: true, ts: Date.now() })));
-      this.sendPeerList(socket);
+      this.onHello(socket, peerIdHex, data);
+      return;
+    }
+
+    if (packet.type === PACKET_TYPES.HELLO_REPLY) {
+      this.onHelloReply(socket, peerIdHex, data);
+      return;
+    }
+
+    if (packet.type === PACKET_TYPES.AUTH) {
+      this.onAuth(socket, peerIdHex, data);
+      return;
+    }
+
+    if (packet.type === PACKET_TYPES.AUTH_OK) {
+      this.onAuthOk(peerIdHex);
       return;
     }
 
@@ -268,6 +506,12 @@ export class ArchipelNodeRuntime {
           this.connectToPeer(peer.ip, peer.tcp_port);
         }
       }
+      return;
+    }
+
+    if (packet.type === PACKET_TYPES.MSG) {
+      this.onEncryptedMessage(peerIdHex, data);
+      this.peerTable.markSeen(peerIdHex);
       return;
     }
 
