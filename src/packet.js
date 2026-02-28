@@ -7,7 +7,10 @@ export const PACKET_TYPES = {
   CHUNK_REQ: 0x04,
   CHUNK_DATA: 0x05,
   MANIFEST: 0x06,
-  ACK: 0x07
+  ACK: 0x07,
+  HELLO_REPLY: 0x08,
+  AUTH: 0x09,
+  AUTH_OK: 0x0a
 };
 
 export const MAGIC = Buffer.from('ARCP');
