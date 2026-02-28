@@ -1,9 +1,10 @@
+node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 
 .env
-*.pem
 *.key
 .archipel/
 logs/
+keys/**/private.pem

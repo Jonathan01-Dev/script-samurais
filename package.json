@@ -1,0 +1,16 @@
+{
+  "name": "archipel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Archipel P2P LAN protocol - Sprint 0 bootstrap",
+  "type": "module",
+  "scripts": {
+    "init:keys": "node scripts/generate-keys.js",
+    "init:keys:5": "node scripts/generate-keys.js --count=5",
+    "node:run": "node src/cli.js run --node node1 --tcp-port 7777",
+    "node:run:2": "node src/cli.js run --node node2 --tcp-port 7778",
+    "node:run:3": "node src/cli.js run --node node3 --tcp-port 7779",
+    "smoke:network": "node scripts/smoke-network.js",
+    "check:s1": "node scripts/check-sprint1.js"
+  }
+}
